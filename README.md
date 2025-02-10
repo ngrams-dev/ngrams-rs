@@ -1,2 +1,5 @@
 # ngrams-rs
-A Rust library to search the Google Books Ngram Dataset.
+
+A Rust client to interact with the https://ngrams.dev search engine.
+
+**This is work in progress -- do not use until there is an official release.**

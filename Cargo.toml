@@ -1,0 +1,11 @@
+[package]
+name = "ngrams"
+version = "0.0.0"
+authors = ["Martin Trenkmann <contact@ngrams.dev>"]
+edition = "2021"
+description = "A Rust library to search the Google Books Ngram Dataset"
+homepage = "https://ngrams.dev"
+repository = "https://github.com/ngrams-dev/ngrams-rs"
+license = "MIT"
+
+[dependencies]
