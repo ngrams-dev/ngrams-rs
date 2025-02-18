@@ -31,10 +31,19 @@ impl Client {
         query: &str,
         corpus: Corpus,
         options: &SearchOptions,
-        storage: &'a mut StringStorage,
+        scratch: &'a mut String,
     ) -> Result<PageView<'a>, Error> {
-        storage.0 = self
-            .client
+        *scratch = self.search_raw(query, corpus, options).await?;
+        Ok(serde_json::from_str(scratch)?)
+    }
+
+    pub async fn search_raw(
+        &self,
+        query: &str,
+        corpus: Corpus,
+        options: &SearchOptions,
+    ) -> Result<String, reqwest::Error> {
+        self.client
             .get(format!("{}/{}/search", BASE_URL, corpus.label()))
             .header("user-agent", &self.user_agent)
             .query(&[
@@ -45,8 +54,7 @@ impl Client {
             .send()
             .await?
             .text()
-            .await?;
-        Ok(serde_json::from_str(&storage.0)?)
+            .await
     }
 }
 
@@ -162,14 +170,10 @@ impl Default for SearchOptions {
     }
 }
 
-#[derive(Default)]
-pub struct StringStorage(String);
-
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Page {
     pub query_tokens: Vec<QueryToken>,
-    // TODO Consider to use smallvec
     pub ngrams: Vec<NgramLite>,
     next_page_token: Option<String>,
     next_page_link: Option<String>,
@@ -195,9 +199,7 @@ impl From<&PageView<'_>> for Page {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageView<'a> {
-    // TODO Consider to use smallvec
     pub query_tokens: Vec<QueryTokenView<'a>>,
-    // TODO Consider to use smallvec
     pub ngrams: Vec<NgramLiteView<'a>>,
     next_page_token: Option<&'a str>,
     next_page_link: Option<&'a str>,
@@ -292,7 +294,6 @@ pub struct NgramLite {
     pub id: String,
     pub abs_total_match_count: u64,
     pub rel_total_match_count: f64,
-    // TODO Consider to use smallvec
     pub tokens: Vec<NgramToken>,
     #[serde(default)]
     pub r#abstract: bool,
@@ -322,7 +323,6 @@ pub struct NgramLiteView<'a> {
     pub id: &'a str,
     pub abs_total_match_count: u64,
     pub rel_total_match_count: f64,
-    // TODO Consider to use smallvec
     pub tokens: Vec<NgramTokenView<'a>>,
     #[serde(default)]
     pub r#abstract: bool,
@@ -421,13 +421,13 @@ pub enum NgramTokenKind {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Client, Corpus, SearchOptions, StringStorage};
+    use crate::{Client, Corpus, SearchOptions};
 
     #[tokio::test]
     async fn hello() {
         let client = Client::new();
         let options = SearchOptions::default();
-        let mut buf = StringStorage::default();
+        let mut buf = String::new();
         let page = client
             .search("hello *", Corpus::English, &options, &mut buf)
             .await
