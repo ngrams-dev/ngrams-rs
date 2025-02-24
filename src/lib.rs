@@ -8,15 +8,16 @@ use std::fmt;
 
 const BASE_URL: &str = "https://api.ngrams.dev";
 
+#[derive(Clone)]
 pub struct Client {
-    client: reqwest::Client,
+    inner: reqwest::Client,
     user_agent: String,
 }
 
 impl Client {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            inner: reqwest::Client::new(),
             user_agent: format!(
                 "{}/{}/{}",
                 env!("CARGO_PKG_NAME"),
@@ -26,35 +27,15 @@ impl Client {
         }
     }
 
-    pub async fn search<'a>(
+    pub fn search<Q: Into<String>>(
         &self,
-        query: &str,
+        query: Q,
         corpus: Corpus,
-        options: &SearchOptions,
-        scratch: &'a mut String,
-    ) -> Result<PageView<'a>, Error> {
-        *scratch = self.search_raw(query, corpus, options).await?;
-        Ok(serde_json::from_str(scratch)?)
-    }
-
-    pub async fn search_raw(
-        &self,
-        query: &str,
-        corpus: Corpus,
-        options: &SearchOptions,
-    ) -> Result<String, reqwest::Error> {
-        self.client
-            .get(format!("{}/{}/search", BASE_URL, corpus.label()))
-            .header("user-agent", &self.user_agent)
-            .query(&[
-                ("query", query),
-                ("flags", &options.to_flags()),
-                ("limit", &options.max_page_size.to_string()),
-            ])
-            .send()
-            .await?
-            .text()
-            .await
+        options: SearchOptions,
+    ) -> Pages {
+        Pages::new(self.clone(), query.into(), corpus, options)
+        // assert_ne!(options.max_page_count, 0);
+        // LinkedPage::fetch(self.clone(), query.into(), corpus, options, None).await
     }
 }
 
@@ -64,42 +45,7 @@ impl Default for Client {
     }
 }
 
-#[derive(Debug)]
-pub enum Error {
-    Http(reqwest::Error),
-    Serde(serde_json::Error),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Http(err) => err.fmt(f),
-            Error::Serde(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Http(err) => err.source(),
-            Error::Serde(err) => err.source(),
-        }
-    }
-}
-
-impl From<reqwest::Error> for Error {
-    fn from(value: reqwest::Error) -> Self {
-        Self::Http(value)
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Serde(value)
-    }
-}
-
+#[derive(Clone, Copy)]
 pub enum Corpus {
     English,
     German,
@@ -116,8 +62,10 @@ impl Corpus {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct SearchOptions {
     pub max_page_size: u8,
+    pub max_page_count: u32,
     pub case_sensitive: bool,
     pub collapse_result: bool,
     pub exclude_punctuation_marks: bool,
@@ -128,7 +76,7 @@ pub struct SearchOptions {
 }
 
 impl SearchOptions {
-    fn to_flags(&self) -> String {
+    fn to_flags(self) -> String {
         let mut flags = String::new();
         if self.case_sensitive {
             flags.push_str("cs");
@@ -159,6 +107,7 @@ impl Default for SearchOptions {
     fn default() -> Self {
         Self {
             max_page_size: 100,
+            max_page_count: 10,
             case_sensitive: false,
             collapse_result: false,
             exclude_punctuation_marks: false,
@@ -170,28 +119,74 @@ impl Default for SearchOptions {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Page {
-    pub query_tokens: Vec<QueryToken>,
-    pub ngrams: Vec<NgramLite>,
-    next_page_token: Option<String>,
-    next_page_link: Option<String>,
+pub struct Pages {
+    client: Client,
+    query: String,
+    corpus: Corpus,
+    options: SearchOptions,
+    payload: String,
+    next: Option<String>,
 }
 
-impl Page {
-    pub fn to_page_view(&self) -> PageView {
-        PageView::from(self)
-    }
-}
-
-impl From<&PageView<'_>> for Page {
-    fn from(page: &PageView) -> Self {
+impl Pages {
+    fn new(client: Client, query: String, corpus: Corpus, options: SearchOptions) -> Self {
         Self {
-            query_tokens: page.query_tokens.iter().map(QueryToken::from).collect(),
-            ngrams: page.ngrams.iter().map(NgramLite::from).collect(),
-            next_page_token: page.next_page_token.map(String::from),
-            next_page_link: page.next_page_link.map(String::from),
+            client,
+            query,
+            corpus,
+            options,
+            payload: String::new(),
+            next: None,
+        }
+    }
+
+    pub async fn next(&mut self) -> Option<Result<PageView, Error>> {
+        if self.options.max_page_count == 0 {
+            return None;
+        }
+
+        let max_page_size = self.options.max_page_size.to_string();
+        let mut params = vec![("query", self.query.as_str()), ("limit", &max_page_size)];
+
+        let flags = self.options.to_flags();
+        if !flags.is_empty() {
+            params.push(("flags", &flags));
+        }
+
+        if let Some(next) = &self.next {
+            params.push(("start", next));
+        }
+
+        match internal::search(&self.client, self.corpus, &params).await {
+            Err(err) => Some(Err(Error::Http(err))),
+            Ok(json) => {
+                self.payload = json;
+                match serde_json::from_str::<internal::SearchResult>(&self.payload) {
+                    Err(err) => Some(Err(Error::Serde(err))),
+                    Ok(result) => match result.error {
+                        Some(err) => Some(Err(Error::App(AppError {
+                            code: err.code,
+                            query_tokens: result.query_tokens,
+                        }))),
+                        None => {
+                            match result.next_page_token {
+                                Some(token) => {
+                                    self.next = Some(token.into());
+                                    self.options.max_page_count -= 1;
+                                }
+                                None => {
+                                    self.next = None;
+                                    self.options.max_page_count = 0;
+                                }
+                            }
+                            Some(Ok(PageView {
+                                query_tokens: result.query_tokens.unwrap(),
+                                ngrams: result.ngrams.unwrap(),
+                            }))
+                        }
+                    },
+                }
+            }
         }
     }
 }
@@ -199,10 +194,9 @@ impl From<&PageView<'_>> for Page {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageView<'a> {
+    #[serde(borrow)]
     pub query_tokens: Vec<QueryTokenView<'a>>,
     pub ngrams: Vec<NgramLiteView<'a>>,
-    next_page_token: Option<&'a str>,
-    next_page_link: Option<&'a str>,
 }
 
 impl PageView<'_> {
@@ -211,39 +205,7 @@ impl PageView<'_> {
     }
 }
 
-impl<'a> From<&'a Page> for PageView<'a> {
-    fn from(page: &'a Page) -> Self {
-        Self {
-            query_tokens: page.query_tokens.iter().map(QueryTokenView::from).collect(),
-            ngrams: page.ngrams.iter().map(NgramLiteView::from).collect(),
-            next_page_token: page.next_page_token.as_deref(),
-            next_page_link: page.next_page_link.as_deref(),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct QueryToken {
-    pub kind: QueryTokenKind,
-    pub text: String,
-}
-
-impl QueryToken {
-    pub fn to_query_token_view(&self) -> QueryTokenView {
-        QueryTokenView::from(self)
-    }
-}
-
-impl From<&QueryTokenView<'_>> for QueryToken {
-    fn from(token: &QueryTokenView) -> Self {
-        Self {
-            kind: token.kind,
-            text: token.text.to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct QueryTokenView<'a> {
     pub kind: QueryTokenKind,
     #[serde(borrow)]
@@ -256,16 +218,7 @@ impl QueryTokenView<'_> {
     }
 }
 
-impl<'a> From<&'a QueryToken> for QueryTokenView<'a> {
-    fn from(token: &'a QueryToken) -> Self {
-        Self {
-            kind: token.kind,
-            text: Cow::Borrowed(&token.text),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryTokenKind {
     Term,
@@ -288,36 +241,7 @@ pub enum QueryTokenKind {
     TermGroup,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NgramLite {
-    pub id: String,
-    pub abs_total_match_count: u64,
-    pub rel_total_match_count: f64,
-    pub tokens: Vec<NgramToken>,
-    #[serde(default)]
-    pub r#abstract: bool,
-}
-
-impl NgramLite {
-    pub fn to_ngram_lite_view(&self) -> NgramLiteView {
-        NgramLiteView::from(self)
-    }
-}
-
-impl From<&NgramLiteView<'_>> for NgramLite {
-    fn from(ngram: &NgramLiteView) -> Self {
-        Self {
-            id: ngram.id.to_string(),
-            abs_total_match_count: ngram.abs_total_match_count,
-            rel_total_match_count: ngram.rel_total_match_count,
-            tokens: ngram.tokens.iter().map(NgramToken::from).collect(),
-            r#abstract: ngram.r#abstract,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NgramLiteView<'a> {
     pub id: &'a str,
@@ -334,46 +258,7 @@ impl NgramLiteView<'_> {
     }
 }
 
-impl<'a> From<&'a NgramLite> for NgramLiteView<'a> {
-    fn from(ngram: &'a NgramLite) -> Self {
-        Self {
-            id: ngram.id.as_str(),
-            abs_total_match_count: ngram.abs_total_match_count,
-            rel_total_match_count: ngram.rel_total_match_count,
-            tokens: ngram.tokens.iter().map(NgramTokenView::from).collect(),
-            r#abstract: ngram.r#abstract,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct NgramToken {
-    pub kind: NgramTokenKind,
-    pub text: String,
-    #[serde(default)]
-    pub inserted: bool,
-    #[serde(default)]
-    pub completed: bool,
-}
-
-impl NgramToken {
-    pub fn to_ngram_token_view(&self) -> NgramTokenView {
-        NgramTokenView::from(self)
-    }
-}
-
-impl From<&NgramTokenView<'_>> for NgramToken {
-    fn from(token: &NgramTokenView) -> Self {
-        Self {
-            kind: token.kind,
-            text: token.text.to_string(),
-            inserted: token.inserted,
-            completed: token.completed,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct NgramTokenView<'a> {
     pub kind: NgramTokenKind,
     #[serde(borrow)]
@@ -390,18 +275,7 @@ impl NgramTokenView<'_> {
     }
 }
 
-impl<'a> From<&'a NgramToken> for NgramTokenView<'a> {
-    fn from(token: &'a NgramToken) -> Self {
-        Self {
-            kind: token.kind,
-            text: Cow::Borrowed(&token.text),
-            inserted: token.inserted,
-            completed: token.completed,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NgramTokenKind {
     Term,
@@ -419,20 +293,274 @@ pub enum NgramTokenKind {
     SentenceEnd,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Page {
+    pub query_tokens: Vec<QueryToken>,
+    pub ngrams: Vec<NgramLite>,
+}
+
+impl From<&PageView<'_>> for Page {
+    fn from(page: &PageView) -> Self {
+        Self {
+            query_tokens: page.query_tokens.iter().map(QueryToken::from).collect(),
+            ngrams: page.ngrams.iter().map(NgramLite::from).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct QueryToken {
+    pub kind: QueryTokenKind,
+    pub text: String,
+}
+
+impl From<&QueryTokenView<'_>> for QueryToken {
+    fn from(token: &QueryTokenView) -> Self {
+        Self {
+            kind: token.kind,
+            text: token.text.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NgramLite {
+    pub id: String,
+    pub abs_total_match_count: u64,
+    pub rel_total_match_count: f64,
+    pub tokens: Vec<NgramToken>,
+    #[serde(default)]
+    pub r#abstract: bool,
+}
+
+impl From<&NgramLiteView<'_>> for NgramLite {
+    fn from(ngram: &NgramLiteView) -> Self {
+        Self {
+            id: ngram.id.to_string(),
+            abs_total_match_count: ngram.abs_total_match_count,
+            rel_total_match_count: ngram.rel_total_match_count,
+            tokens: ngram.tokens.iter().map(NgramToken::from).collect(),
+            r#abstract: ngram.r#abstract,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct NgramToken {
+    pub kind: NgramTokenKind,
+    pub text: String,
+    #[serde(default)]
+    pub inserted: bool,
+    #[serde(default)]
+    pub completed: bool,
+}
+
+impl From<&NgramTokenView<'_>> for NgramToken {
+    fn from(token: &NgramTokenView) -> Self {
+        Self {
+            kind: token.kind,
+            text: token.text.to_string(),
+            inserted: token.inserted,
+            completed: token.completed,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Error<'a> {
+    App(AppError<'a>),
+    Http(reqwest::Error),
+    Serde(serde_json::Error),
+}
+
+impl Error<'_> {
+    pub fn from_code(code: ErrorCode) -> Self {
+        Self::App(AppError {
+            code,
+            query_tokens: None,
+        })
+    }
+}
+
+impl fmt::Display for Error<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::App(err) => err.fmt(f),
+            Self::Http(err) => err.fmt(f),
+            Self::Serde(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for Error<'_> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::App(_) => None,
+            Self::Http(err) => err.source(),
+            Self::Serde(err) => err.source(),
+        }
+    }
+}
+
+/// https://github.com/ngrams-dev/general/wiki/REST-API#errorresponse
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct AppError<'a> {
+    pub code: ErrorCode,
+    #[serde(borrow)]
+    pub query_tokens: Option<Vec<QueryTokenView<'a>>>,
+}
+
+impl fmt::Display for AppError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::error::Error for AppError<'_> {}
+
+// https://github.com/ngrams-dev/general/wiki/REST-API#errorcode
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub enum ErrorCode {
+    #[serde(rename = "INVALID_PARAMETER.LIMIT")]
+    InvalidParameterLimit,
+    InvalidParameterStart,
+    InvalidQueryBadAlternation,
+    InvalidQueryBadCompletion,
+    InvalidQueryBadTermGroup,
+    InvalidQueryNoTerm,
+    InvalidQueryTooExpensive,
+    InvalidQueryTooManyTokens,
+    InvalidRequestBody,
+    InvalidUtf8Encoding,
+    MissingParameterQuery,
+}
+
+/// Internal module containing implementation details.
+/// Used for benchmarking. Don't use directly.
+pub mod internal {
+    use crate::{Client, Corpus, ErrorCode, NgramLiteView, QueryTokenView, BASE_URL};
+    use serde::Deserialize;
+    use std::borrow::Cow;
+
+    pub async fn search(
+        client: &Client,
+        corpus: Corpus,
+        params: &[(&str, &str)],
+    ) -> Result<String, reqwest::Error> {
+        client
+            .inner
+            .get(format!("{}/{}/search", BASE_URL, corpus.label()))
+            .header("user-agent", &client.user_agent)
+            .query(params)
+            .send()
+            .await?
+            .text()
+            .await
+    }
+
+    /// Union of
+    /// - https://github.com/ngrams-dev/general/wiki/REST-API#errorresponse
+    /// - https://github.com/ngrams-dev/general/wiki/REST-API#searchresponse
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct SearchResult<'a> {
+        pub(crate) error: Option<Error>,
+        #[serde(borrow)]
+        pub(crate) query_tokens: Option<Vec<QueryTokenView<'a>>>,
+        pub(crate) ngrams: Option<Vec<NgramLiteView<'a>>>,
+        pub(crate) next_page_token: Option<Cow<'a, str>>,
+    }
+
+    /// https://github.com/ngrams-dev/general/wiki/REST-API#error
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct Error {
+        pub(crate) code: ErrorCode,
+        /// Currently unused.
+        pub(crate) context: Option<String>,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{Client, Corpus, SearchOptions};
+    use crate::{AppError, Client, Corpus, Error, ErrorCode, SearchOptions};
 
     #[tokio::test]
-    async fn hello() {
+    async fn search_and_fetch_first_three_pages() {
         let client = Client::new();
-        let options = SearchOptions::default();
-        let mut buf = String::new();
-        let page = client
-            .search("hello *", Corpus::English, &options, &mut buf)
-            .await
-            .unwrap();
-        assert_eq!(page.query_tokens.len(), 2);
-        assert_eq!(page.ngrams.len(), 100);
+
+        let options = SearchOptions {
+            max_page_count: 3,
+            ..Default::default()
+        };
+
+        let mut pages = client.search("hello * *", Corpus::English, options);
+
+        let mut num_ngrams = 0;
+        while let Some(res) = pages.next().await {
+            match res {
+                Ok(page) => {
+                    assert_eq!(page.query_tokens.len(), 3);
+                    assert_eq!(page.ngrams.len(), 100);
+                    num_ngrams += page.ngrams.len();
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    break;
+                }
+            }
+        }
+        assert_eq!(num_ngrams, 300);
+    }
+
+    #[tokio::test]
+    async fn search_and_fetch_all_pages() {
+        let client = Client::new();
+
+        let options = SearchOptions {
+            max_page_count: u32::MAX,
+            ..Default::default()
+        };
+
+        let mut pages = client.search("what * * day", Corpus::English, options);
+
+        let mut num_pages = 0;
+        let mut num_ngrams = 0;
+        while let Some(res) = pages.next().await {
+            match res {
+                Ok(page) => {
+                    assert_eq!(page.query_tokens.len(), 4);
+                    num_ngrams += page.ngrams.len();
+                    num_pages += 1;
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    break;
+                }
+            }
+        }
+        assert_eq!(num_ngrams, 1225);
+        assert_eq!(num_pages, 13);
+    }
+
+    #[tokio::test]
+    async fn check_error_invalid_parameter_limit() {
+        let client = Client::new();
+        let options = SearchOptions {
+            max_page_size: 101, // Invalid
+            ..Default::default()
+        };
+
+        let mut pages = client.search("test", Corpus::English, options);
+
+        match pages.next().await {
+            Some(Err(Error::App(AppError { code, query_tokens }))) => {
+                assert_eq!(code, ErrorCode::InvalidParameterLimit);
+                assert_eq!(query_tokens, None);
+            }
+            _ => panic!(),
+        }
     }
 }

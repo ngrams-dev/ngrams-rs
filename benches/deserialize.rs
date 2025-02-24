@@ -1,13 +1,13 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use ngrams::{Client, Corpus, Page, PageView, SearchOptions};
+use ngrams::{internal, Client, Corpus, Page, PageView};
 use tokio::runtime::Runtime;
 
 fn search() -> String {
     let client = Client::new();
-    let options = SearchOptions::default();
+    let params = &[("query", "you are * * *")];
     Runtime::new()
         .unwrap()
-        .block_on(client.search_raw("you are * * *", Corpus::English, &options))
+        .block_on(internal::search(&client, Corpus::English, params))
         .unwrap()
 }
 
