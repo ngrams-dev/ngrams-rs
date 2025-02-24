@@ -34,8 +34,6 @@ impl Client {
         options: SearchOptions,
     ) -> Pages {
         Pages::new(self.clone(), query.into(), corpus, options)
-        // assert_ne!(options.max_page_count, 0);
-        // LinkedPage::fetch(self.clone(), query.into(), corpus, options, None).await
     }
 }
 
@@ -549,7 +547,7 @@ mod tests {
     async fn check_error_invalid_parameter_limit() {
         let client = Client::new();
         let options = SearchOptions {
-            max_page_size: 101, // Invalid
+            max_page_size: 101, // Invalid value
             ..Default::default()
         };
 
