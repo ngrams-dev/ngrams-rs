@@ -35,6 +35,15 @@ impl Client {
     ) -> Pages {
         Pages::new(self.clone(), query.into(), corpus, options)
     }
+
+    pub async fn get_corpus_info(&self, corpus: Corpus) -> Result<CorpusInfo, Error> {
+        let info = internal::get(self, format!("{}/{}/info", BASE_URL, corpus.label()))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(info)
+    }
 }
 
 impl Default for Client {
@@ -58,6 +67,25 @@ impl Corpus {
             Corpus::Russian => "rus",
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CorpusInfo {
+    pub name: String,
+    pub label: String,
+    pub stats: [CorpusStat; 5],
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CorpusStat {
+    pub num_ngrams: u64,
+    pub min_year: u16,
+    pub max_year: u16,
+    pub min_match_count: u32,
+    pub max_match_count: u32,
+    pub min_total_match_count: u64,
+    pub max_total_match_count: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -366,6 +394,7 @@ impl From<&NgramTokenView<'_>> for NgramToken {
     }
 }
 
+// TODO Remove lifetime from Error
 #[derive(Debug)]
 pub enum Error<'a> {
     App(AppError<'a>),
@@ -399,6 +428,12 @@ impl std::error::Error for Error<'_> {
             Self::Http(err) => err.source(),
             Self::Serde(err) => err.source(),
         }
+    }
+}
+
+impl From<reqwest::Error> for Error<'_> {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Http(err)
     }
 }
 
@@ -439,18 +474,23 @@ pub enum ErrorCode {
 /// Used for benchmarking. Don't use directly.
 pub mod internal {
     use crate::{Client, Corpus, ErrorCode, NgramLiteView, QueryTokenView, BASE_URL};
+    use reqwest::RequestBuilder;
     use serde::Deserialize;
     use std::borrow::Cow;
+
+    pub fn get(client: &Client, url: String) -> RequestBuilder {
+        client
+            .inner
+            .get(url)
+            .header("user-agent", &client.user_agent)
+    }
 
     pub async fn search(
         client: &Client,
         corpus: Corpus,
         params: &[(&str, &str)],
     ) -> Result<String, reqwest::Error> {
-        client
-            .inner
-            .get(format!("{}/{}/search", BASE_URL, corpus.label()))
-            .header("user-agent", &client.user_agent)
+        get(client, format!("{}/{}/search", BASE_URL, corpus.label()))
             .query(params)
             .send()
             .await?
