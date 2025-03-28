@@ -2,9 +2,10 @@
 // https://ngrams.dev
 // License: MIT
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::fmt;
+use std::ops::Deref;
 
 const BASE_URL: &str = "https://api.ngrams.dev";
 
@@ -37,7 +38,16 @@ impl Client {
     }
 
     pub async fn get_corpus_info(&self, corpus: Corpus) -> Result<CorpusInfo, Error> {
-        let info = internal::get(self, format!("{}/{}/info", BASE_URL, corpus.label()))
+        let info = internal::get(self, corpus, "info")
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(info)
+    }
+
+    pub async fn get_total_counts(&self, corpus: Corpus) -> Result<TotalCounts, Error> {
+        let info = internal::get(self, corpus, "total_counts")
             .send()
             .await?
             .json()
@@ -67,25 +77,6 @@ impl Corpus {
             Corpus::Russian => "rus",
         }
     }
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct CorpusInfo {
-    pub name: String,
-    pub label: String,
-    pub stats: [CorpusStat; 5],
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CorpusStat {
-    pub num_ngrams: u64,
-    pub min_year: u16,
-    pub max_year: u16,
-    pub min_match_count: u32,
-    pub max_match_count: u32,
-    pub min_total_match_count: u64,
-    pub max_total_match_count: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -470,6 +461,74 @@ pub enum ErrorCode {
     MissingParameterQuery,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CorpusInfo {
+    pub name: String,
+    pub label: String,
+    pub stats: [CorpusStat; 5],
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CorpusStat {
+    pub num_ngrams: u64,
+    pub min_year: u16,
+    pub max_year: u16,
+    pub min_match_count: u32,
+    pub max_match_count: u32,
+    pub min_total_match_count: u64,
+    pub max_total_match_count: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TotalCounts {
+    pub min_year: u16,
+    pub max_year: u16,
+    pub match_counts: [TotalCountsByYear; 5],
+}
+
+#[derive(Debug)]
+pub struct TotalCountsByYear([u64; TOTAL_COUNTS_BY_YEAR_LEN]);
+pub const TOTAL_COUNTS_BY_YEAR_LEN: usize = 550;
+
+impl Deref for TotalCountsByYear {
+    type Target = [u64];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl Serialize for TotalCountsByYear {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TotalCountsByYear {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let deserialized = Vec::<u64>::deserialize(deserializer)?;
+        if deserialized.len() != TOTAL_COUNTS_BY_YEAR_LEN {
+            let expected = TOTAL_COUNTS_BY_YEAR_LEN.to_string();
+            Err(serde::de::Error::invalid_length(
+                deserialized.len(),
+                &expected.as_str(),
+            ))
+        } else {
+            let mut counts = TotalCountsByYear([0; TOTAL_COUNTS_BY_YEAR_LEN]);
+            counts.0.copy_from_slice(&deserialized);
+            Ok(counts)
+        }
+    }
+}
+
 /// Internal module containing implementation details.
 /// Used for benchmarking. Don't use directly.
 pub mod internal {
@@ -478,10 +537,10 @@ pub mod internal {
     use serde::Deserialize;
     use std::borrow::Cow;
 
-    pub fn get(client: &Client, url: String) -> RequestBuilder {
+    pub fn get(client: &Client, corpus: Corpus, resource: &str) -> RequestBuilder {
         client
             .inner
-            .get(url)
+            .get(format!("{}/{}/{}", BASE_URL, corpus.label(), resource))
             .header("user-agent", &client.user_agent)
     }
 
@@ -490,7 +549,7 @@ pub mod internal {
         corpus: Corpus,
         params: &[(&str, &str)],
     ) -> Result<String, reqwest::Error> {
-        get(client, format!("{}/{}/search", BASE_URL, corpus.label()))
+        get(client, corpus, "search")
             .query(params)
             .send()
             .await?

@@ -1,7 +1,7 @@
 use ngrams::{Client, Corpus, CorpusInfo, CorpusStat};
 
 #[tokio::test]
-async fn hello() {
+async fn get_corpus_info() {
     let client = Client::new();
     match client.get_corpus_info(Corpus::English).await {
         Ok(info) => {
