@@ -4,8 +4,9 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
-use std::fmt;
+use std::fmt::Debug;
 use std::ops::Deref;
+use std::{error, fmt};
 
 const BASE_URL: &str = "https://api.ngrams.dev";
 
@@ -35,6 +36,11 @@ impl Client {
         options: SearchOptions,
     ) -> Pages {
         Pages::new(self.clone(), query.into(), corpus, options)
+    }
+
+    pub async fn get_ngram(&self, corpus: Corpus, id: &str) -> Result<Option<Ngram>, Error> {
+        let ngram = internal::get(self, corpus, id).send().await?.json().await?;
+        Ok(ngram)
     }
 
     pub async fn get_corpus_info(&self, corpus: Corpus) -> Result<CorpusInfo, Error> {
@@ -175,15 +181,17 @@ impl Pages {
         }
 
         match internal::search(&self.client, self.corpus, &params).await {
-            Err(err) => Some(Err(Error::Http(err))),
+            Err(err) => Some(Err(Error::Connection(err))),
             Ok(json) => {
                 self.payload = json;
                 match serde_json::from_str::<internal::SearchResult>(&self.payload) {
-                    Err(err) => Some(Err(Error::Serde(err))),
+                    Err(err) => Some(Err(Error::Parse(err))),
                     Ok(result) => match result.error {
-                        Some(err) => Some(Err(Error::App(AppError {
+                        Some(err) => Some(Err(Error::BadInput(BadInputError {
                             code: err.code,
-                            query_tokens: result.query_tokens,
+                            query_tokens: result
+                                .query_tokens
+                                .map(|tokens| tokens.iter().map(QueryToken::from).collect()),
                         }))),
                         None => {
                             match result.next_page_token {
@@ -385,65 +393,86 @@ impl From<&NgramTokenView<'_>> for NgramToken {
     }
 }
 
-// TODO Remove lifetime from Error
-#[derive(Debug)]
-pub enum Error<'a> {
-    App(AppError<'a>),
-    Http(reqwest::Error),
-    Serde(serde_json::Error),
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Ngram {
+    pub id: String,
+    pub abs_total_match_count: u64,
+    pub rel_total_match_count: f64,
+    pub tokens: Vec<NgramToken>,
+    pub stats: Vec<NgramStat>,
 }
 
-impl Error<'_> {
-    pub fn from_code(code: ErrorCode) -> Self {
-        Self::App(AppError {
-            code,
-            query_tokens: None,
-        })
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NgramStat {
+    pub year: u16,
+    pub abs_match_count: u64,
+    pub rel_match_count: f64,
+}
+
+impl NgramStat {
+    pub fn new(year: u16, abs_match_count: u64, rel_match_count: f64) -> Self {
+        Self {
+            year,
+            abs_match_count,
+            rel_match_count,
+        }
     }
 }
 
-impl fmt::Display for Error<'_> {
+#[derive(Debug)]
+pub enum Error {
+    Connection(reqwest::Error),
+    BadServer(reqwest::StatusCode),
+    BadInput(BadInputError),
+    Parse(serde_json::Error),
+}
+
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::App(err) => err.fmt(f),
-            Self::Http(err) => err.fmt(f),
-            Self::Serde(err) => err.fmt(f),
+            Self::Connection(err) => fmt::Display::fmt(err, f),
+            Self::BadServer(err) => fmt::Display::fmt(err, f),
+            Self::BadInput(err) => fmt::Display::fmt(err, f),
+            Self::Parse(err) => fmt::Display::fmt(err, f),
         }
     }
 }
 
-impl std::error::Error for Error<'_> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Self::App(_) => None,
-            Self::Http(err) => err.source(),
-            Self::Serde(err) => err.source(),
+            Error::Connection(err) => err.source(),
+            Error::BadServer(_) => None,
+            Error::BadInput(_) => None,
+            Error::Parse(err) => err.source(),
         }
     }
 }
 
-impl From<reqwest::Error> for Error<'_> {
+impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
-        Self::Http(err)
+        Self::Connection(err)
     }
 }
 
 /// https://github.com/ngrams-dev/general/wiki/REST-API#errorresponse
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct AppError<'a> {
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct BadInputError {
     pub code: ErrorCode,
-    #[serde(borrow)]
-    pub query_tokens: Option<Vec<QueryTokenView<'a>>>,
+    pub query_tokens: Option<Vec<QueryToken>>,
 }
 
-impl fmt::Display for AppError<'_> {
+impl fmt::Display for BadInputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
     }
 }
 
-impl std::error::Error for AppError<'_> {}
+impl error::Error for BadInputError {}
 
+// TODO Remove error codes that cannot happen.
 // https://github.com/ngrams-dev/general/wiki/REST-API#errorcode
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum ErrorCode {
@@ -582,7 +611,7 @@ pub mod internal {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AppError, Client, Corpus, Error, ErrorCode, SearchOptions};
+    use crate::{BadInputError, Client, Corpus, Error, ErrorCode, SearchOptions};
 
     #[tokio::test]
     async fn search_and_fetch_first_three_pages() {
@@ -653,7 +682,7 @@ mod tests {
         let mut pages = client.search("test", Corpus::English, options);
 
         match pages.next().await {
-            Some(Err(Error::App(AppError { code, query_tokens }))) => {
+            Some(Err(Error::BadInput(BadInputError { code, query_tokens }))) => {
                 assert_eq!(code, ErrorCode::InvalidParameterLimit);
                 assert_eq!(query_tokens, None);
             }
