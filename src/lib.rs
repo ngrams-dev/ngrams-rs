@@ -2,6 +2,7 @@
 // https://ngrams.dev
 // License: MIT
 
+use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::fmt::Debug;
@@ -39,26 +40,28 @@ impl Client {
     }
 
     pub async fn get_ngram(&self, corpus: Corpus, id: &str) -> Result<Option<Ngram>, Error> {
-        let ngram = internal::get(self, corpus, id).send().await?.json().await?;
-        Ok(ngram)
+        let res = internal::get(self, corpus, id).send().await?;
+        match res.status() {
+            StatusCode::OK => Ok(Some(res.json().await?)),
+            StatusCode::NOT_FOUND => Ok(None),
+            other => Err(Error::BadStatus(other)),
+        }
     }
 
     pub async fn get_corpus_info(&self, corpus: Corpus) -> Result<CorpusInfo, Error> {
-        let info = internal::get(self, corpus, "info")
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(info)
+        let res = internal::get(self, corpus, "info").send().await?;
+        match res.status() {
+            StatusCode::OK => Ok(res.json().await?),
+            other => Err(Error::BadStatus(other)),
+        }
     }
 
     pub async fn get_total_counts(&self, corpus: Corpus) -> Result<TotalCounts, Error> {
-        let info = internal::get(self, corpus, "total_counts")
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(info)
+        let res = internal::get(self, corpus, "total_counts").send().await?;
+        match res.status() {
+            StatusCode::OK => Ok(res.json().await?),
+            other => Err(Error::BadStatus(other)),
+        }
     }
 }
 
@@ -180,38 +183,46 @@ impl Pages {
             params.push(("start", next));
         }
 
-        match internal::search(&self.client, self.corpus, &params).await {
-            Err(err) => Some(Err(Error::Connection(err))),
-            Ok(json) => {
-                self.payload = json;
-                match serde_json::from_str::<internal::SearchResult>(&self.payload) {
-                    Err(err) => Some(Err(Error::Parse(err))),
-                    Ok(result) => match result.error {
-                        Some(err) => Some(Err(Error::BadInput(BadInputError {
-                            code: err.code,
-                            query_tokens: result
-                                .query_tokens
-                                .map(|tokens| tokens.iter().map(QueryToken::from).collect()),
-                        }))),
-                        None => {
-                            match result.next_page_token {
-                                Some(token) => {
-                                    self.next = Some(token.into());
+        use internal::{get, ErrorResult, SearchResult};
+
+        match get(&self.client, self.corpus, "search")
+            .query(&params)
+            .send()
+            .await
+        {
+            Ok(res) => match res.status() {
+                StatusCode::OK => match res.text().await {
+                    Ok(text) => {
+                        self.payload = text; // NgramTokenView::text backing
+                        match serde_json::from_str::<SearchResult>(&self.payload) {
+                            Ok(res) => {
+                                if let Some(token) = res.next_page_token {
                                     self.options.max_page_count -= 1;
-                                }
-                                None => {
-                                    self.next = None;
+                                    self.next = Some(token.into());
+                                } else {
                                     self.options.max_page_count = 0;
+                                    self.next = None;
                                 }
+                                Some(Ok(PageView {
+                                    query_tokens: res.query_tokens,
+                                    ngrams: res.ngrams,
+                                }))
                             }
-                            Some(Ok(PageView {
-                                query_tokens: result.query_tokens.unwrap(),
-                                ngrams: result.ngrams.unwrap(),
-                            }))
+                            Err(err) => Some(Err(Error::Parse(err))),
                         }
-                    },
-                }
-            }
+                    }
+                    Err(err) => Some(Err(Error::Connection(err))),
+                },
+                StatusCode::BAD_REQUEST => match res.json::<ErrorResult>().await {
+                    Ok(res) => Some(Err(Error::BadInput(BadInputError {
+                        code: res.error.code,
+                        query_tokens: res.query_tokens,
+                    }))),
+                    Err(err) => Some(Err(Error::Connection(err))),
+                },
+                other => Some(Err(Error::BadStatus(other))),
+            },
+            Err(err) => Some(Err(Error::Connection(err))),
         }
     }
 }
@@ -432,7 +443,7 @@ impl PartialEq for NgramStat {
 #[derive(Debug)]
 pub enum Error {
     Connection(reqwest::Error),
-    BadServer(reqwest::StatusCode),
+    BadStatus(StatusCode),
     BadInput(BadInputError),
     Parse(serde_json::Error),
 }
@@ -441,7 +452,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connection(err) => fmt::Display::fmt(err, f),
-            Self::BadServer(err) => fmt::Display::fmt(err, f),
+            Self::BadStatus(err) => fmt::Display::fmt(err, f),
             Self::BadInput(err) => fmt::Display::fmt(err, f),
             Self::Parse(err) => fmt::Display::fmt(err, f),
         }
@@ -452,9 +463,8 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Error::Connection(err) => err.source(),
-            Error::BadServer(_) => None,
-            Error::BadInput(_) => None,
             Error::Parse(err) => err.source(),
+            _ => None,
         }
     }
 }
@@ -568,51 +578,40 @@ impl<'de> Deserialize<'de> for TotalCountsByYear {
 
 /// Internal module containing implementation details.
 /// Used for benchmarking. Don't use directly.
-pub mod internal {
-    use crate::{Client, Corpus, ErrorCode, NgramLiteView, QueryTokenView, BASE_URL};
+mod internal {
+    use crate::{Client, Corpus, ErrorCode, NgramLiteView, QueryToken, QueryTokenView, BASE_URL};
     use reqwest::RequestBuilder;
     use serde::Deserialize;
     use std::borrow::Cow;
 
-    pub fn get(client: &Client, corpus: Corpus, resource: &str) -> RequestBuilder {
+    pub(crate) fn get(client: &Client, corpus: Corpus, resource: &str) -> RequestBuilder {
         client
             .inner
             .get(format!("{}/{}/{}", BASE_URL, corpus.label(), resource))
             .header("user-agent", &client.user_agent)
     }
 
-    pub async fn search(
-        client: &Client,
-        corpus: Corpus,
-        params: &[(&str, &str)],
-    ) -> Result<String, reqwest::Error> {
-        get(client, corpus, "search")
-            .query(params)
-            .send()
-            .await?
-            .text()
-            .await
-    }
-
-    /// Union of
-    /// - https://github.com/ngrams-dev/general/wiki/REST-API#errorresponse
-    /// - https://github.com/ngrams-dev/general/wiki/REST-API#searchresponse
-    #[derive(Debug, Deserialize, PartialEq)]
+    #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub(crate) struct SearchResult<'a> {
-        pub(crate) error: Option<Error>,
         #[serde(borrow)]
-        pub(crate) query_tokens: Option<Vec<QueryTokenView<'a>>>,
-        pub(crate) ngrams: Option<Vec<NgramLiteView<'a>>>,
+        pub(crate) query_tokens: Vec<QueryTokenView<'a>>,
+        pub(crate) ngrams: Vec<NgramLiteView<'a>>,
         pub(crate) next_page_token: Option<Cow<'a, str>>,
     }
 
-    /// https://github.com/ngrams-dev/general/wiki/REST-API#error
-    #[derive(Debug, Deserialize, PartialEq)]
+    #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
+    pub(crate) struct ErrorResult {
+        pub(crate) error: Error,
+        pub(crate) query_tokens: Option<Vec<QueryToken>>,
+    }
+
+    #[derive(Debug, Deserialize)]
     pub(crate) struct Error {
         pub(crate) code: ErrorCode,
         /// Currently unused.
+        #[allow(dead_code)]
         pub(crate) context: Option<String>,
     }
 }
