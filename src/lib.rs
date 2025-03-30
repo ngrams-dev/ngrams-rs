@@ -403,7 +403,7 @@ pub struct Ngram {
     pub stats: Vec<NgramStat>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NgramStat {
     pub year: u16,
@@ -418,6 +418,14 @@ impl NgramStat {
             abs_match_count,
             rel_match_count,
         }
+    }
+}
+
+impl PartialEq for NgramStat {
+    fn eq(&self, other: &Self) -> bool {
+        self.year == other.year
+            && self.abs_match_count == other.abs_match_count
+            && (self.rel_match_count - other.rel_match_count).abs() < f64::EPSILON
     }
 }
 
