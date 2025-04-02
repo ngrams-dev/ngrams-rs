@@ -537,22 +537,24 @@ impl fmt::Display for UnexpectedStatusCode {
 
 impl error::Error for UnexpectedStatusCode {}
 
-// TODO Remove error codes that cannot happen.
-// https://github.com/ngrams-dev/general/wiki/REST-API#errorcode
+/// Subset of error code a user query could generate.
+/// See https://github.com/ngrams-dev/general/wiki/REST-API#errorcode
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum ErrorCode {
     #[serde(rename = "INVALID_PARAMETER.LIMIT")]
     InvalidParameterLimit,
-    InvalidParameterStart,
+    #[serde(rename = "INVALID_QUERY.BAD_ALTERNATION")]
     InvalidQueryBadAlternation,
+    #[serde(rename = "INVALID_QUERY.BAD_COMPLETION")]
     InvalidQueryBadCompletion,
+    #[serde(rename = "INVALID_QUERY.BAD_TERM_GROUP")]
     InvalidQueryBadTermGroup,
+    #[serde(rename = "INVALID_QUERY.NO_TERM")]
     InvalidQueryNoTerm,
+    #[serde(rename = "INVALID_QUERY.TOO_EXPENSIVE")]
     InvalidQueryTooExpensive,
+    #[serde(rename = "INVALID_QUERY.TOO_MANY_TOKENS")]
     InvalidQueryTooManyTokens,
-    InvalidRequestBody,
-    InvalidUtf8Encoding,
-    MissingParameterQuery,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
