@@ -5,7 +5,6 @@
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
-use std::fmt::Debug;
 use std::ops::Deref;
 use std::{error, fmt};
 
@@ -44,7 +43,7 @@ impl Client {
         match res.status() {
             StatusCode::OK => Ok(Some(res.json().await?)),
             StatusCode::NOT_FOUND => Ok(None),
-            other => Err(Error::BadStatus(other)),
+            other => Err(Error::unexpected_status_code(other.as_u16())),
         }
     }
 
@@ -52,7 +51,7 @@ impl Client {
         let res = internal::get(self, corpus, "info").send().await?;
         match res.status() {
             StatusCode::OK => Ok(res.json().await?),
-            other => Err(Error::BadStatus(other)),
+            other => Err(Error::unexpected_status_code(other.as_u16())),
         }
     }
 
@@ -60,7 +59,7 @@ impl Client {
         let res = internal::get(self, corpus, "total_counts").send().await?;
         match res.status() {
             StatusCode::OK => Ok(res.json().await?),
-            other => Err(Error::BadStatus(other)),
+            other => Err(Error::unexpected_status_code(other.as_u16())),
         }
     }
 }
@@ -81,9 +80,9 @@ pub enum Corpus {
 impl Corpus {
     pub fn label(&self) -> &str {
         match self {
-            Corpus::English => "eng",
-            Corpus::German => "ger",
-            Corpus::Russian => "rus",
+            Self::English => "eng",
+            Self::German => "ger",
+            Self::Russian => "rus",
         }
     }
 }
@@ -208,21 +207,21 @@ impl Pages {
                                     ngrams: res.ngrams,
                                 }))
                             }
-                            Err(err) => Some(Err(Error::Parse(err))),
+                            Err(err) => Some(Err(Error::exception(err))),
                         }
                     }
-                    Err(err) => Some(Err(Error::Connection(err))),
+                    Err(err) => Some(Err(Error::exception(err))),
                 },
                 StatusCode::BAD_REQUEST => match res.json::<ErrorResult>().await {
-                    Ok(res) => Some(Err(Error::BadInput(BadInputError {
+                    Ok(res) => Some(Err(Error::bad_input(BadInputError {
                         code: res.error.code,
                         query_tokens: res.query_tokens,
                     }))),
-                    Err(err) => Some(Err(Error::Connection(err))),
+                    Err(err) => Some(Err(Error::exception(err))),
                 },
-                other => Some(Err(Error::BadStatus(other))),
+                other => Some(Err(Error::unexpected_status_code(other.as_u16()))),
             },
-            Err(err) => Some(Err(Error::Connection(err))),
+            Err(err) => Some(Err(Error::connection(err))),
         }
     }
 }
@@ -441,42 +440,79 @@ impl PartialEq for NgramStat {
 }
 
 #[derive(Debug)]
-pub enum Error {
-    Connection(reqwest::Error),
-    BadStatus(StatusCode),
-    BadInput(BadInputError),
-    Parse(serde_json::Error),
+pub struct Error {
+    kind: ErrorKind,
+    source: Option<Box<dyn error::Error>>,
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Connection(err) => fmt::Display::fmt(err, f),
-            Self::BadStatus(err) => fmt::Display::fmt(err, f),
-            Self::BadInput(err) => fmt::Display::fmt(err, f),
-            Self::Parse(err) => fmt::Display::fmt(err, f),
-        }
+impl Error {
+    pub fn new(kind: ErrorKind, source: Option<Box<dyn error::Error>>) -> Self {
+        Self { kind, source }
+    }
+
+    pub fn connection(err: reqwest::Error) -> Self {
+        Self::new(ErrorKind::Connection, Some(Box::new(err)))
+    }
+
+    pub fn exception(err: impl error::Error + 'static) -> Self {
+        Self::new(ErrorKind::Connection, Some(Box::new(err)))
+    }
+
+    pub fn bad_input(err: BadInputError) -> Self {
+        Self::new(ErrorKind::BadInput, Some(Box::new(err)))
+    }
+
+    pub fn unexpected_status_code(code: u16) -> Self {
+        Self::exception(UnexpectedStatusCode(code))
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    pub fn source(&self) -> Option<&dyn error::Error> {
+        self.source.as_deref()
+    }
+
+    pub fn into_bad_input_error(self) -> BadInputError {
+        *self.source.unwrap().downcast::<BadInputError>().unwrap()
     }
 }
 
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            Error::Connection(err) => err.source(),
-            Error::Parse(err) => err.source(),
-            _ => None,
+        self.source.as_deref()
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            ErrorKind::Connection => f.write_str("connection error"),
+            ErrorKind::Exception => f.write_str("unexpected error"),
+            ErrorKind::BadInput => f.write_str("bad input"),
         }
     }
 }
 
 impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
-        Self::Connection(err)
+        Self::connection(err)
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ErrorKind {
+    /// HTTP connection error.
+    Connection,
+    /// Unexpected HTTP status code or invalid JSON.
+    Exception,
+    /// User query or other input was invalid.
+    BadInput,
+}
+
 /// https://github.com/ngrams-dev/general/wiki/REST-API#errorresponse
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug)]
 pub struct BadInputError {
     pub code: ErrorCode,
     pub query_tokens: Option<Vec<QueryToken>>,
@@ -489,6 +525,17 @@ impl fmt::Display for BadInputError {
 }
 
 impl error::Error for BadInputError {}
+
+#[derive(Debug)]
+pub struct UnexpectedStatusCode(u16);
+
+impl fmt::Display for UnexpectedStatusCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unexpected http status code: {}", self.0)
+    }
+}
+
+impl error::Error for UnexpectedStatusCode {}
 
 // TODO Remove error codes that cannot happen.
 // https://github.com/ngrams-dev/general/wiki/REST-API#errorcode
@@ -618,7 +665,7 @@ mod internal {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BadInputError, Client, Corpus, Error, ErrorCode, SearchOptions};
+    use crate::{BadInputError, Client, Corpus, ErrorCode, ErrorKind, SearchOptions};
 
     #[tokio::test]
     async fn search_and_fetch_first_three_pages() {
@@ -689,10 +736,15 @@ mod tests {
         let mut pages = client.search("test", Corpus::English, options);
 
         match pages.next().await {
-            Some(Err(Error::BadInput(BadInputError { code, query_tokens }))) => {
-                assert_eq!(code, ErrorCode::InvalidParameterLimit);
-                assert_eq!(query_tokens, None);
-            }
+            Some(Err(err)) => match err.kind() {
+                ErrorKind::Connection => panic!(),
+                ErrorKind::Exception => panic!(),
+                ErrorKind::BadInput => {
+                    let err = err.source.unwrap().downcast::<BadInputError>().unwrap();
+                    assert_eq!(err.code, ErrorCode::InvalidParameterLimit);
+                    assert_eq!(err.query_tokens, None);
+                }
+            },
             _ => panic!(),
         }
     }
